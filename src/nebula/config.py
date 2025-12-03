@@ -108,6 +108,10 @@ class TrainingConfig:
     gradient_checkpointing: bool = False
     grad_clip: float = 1.0
 
+    # torch.compile options (PyTorch 2.0+)
+    compile: bool = False  # Enable torch.compile
+    compile_mode: str = "default"  # "default", "reduce-overhead", "max-autotune"
+
     # Logging
     log_every: int = 10
     save_every: int = 1000

@@ -105,6 +105,18 @@ def main():
         action="store_true",
         help="Disable MTP auxiliary loss",
     )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="Enable torch.compile (PyTorch 2.0+)",
+    )
+    parser.add_argument(
+        "--compile-mode",
+        type=str,
+        default=None,
+        choices=["default", "reduce-overhead", "max-autotune"],
+        help="torch.compile mode",
+    )
     args = parser.parse_args()
 
     # Load config
@@ -127,6 +139,10 @@ def main():
         config.model.use_moe = False
     if args.no_mtp:
         config.model.use_mtp = False
+    if args.compile:
+        config.training.compile = True
+    if args.compile_mode:
+        config.training.compile_mode = args.compile_mode
 
     # Set seed
     set_seed(config.seed)
@@ -168,6 +184,15 @@ def main():
     print(f"  Block size: {config.model.block_size}")
     print(f"  MTP enabled: {config.model.use_mtp}")
 
+    # Apply torch.compile if enabled
+    if config.training.compile:
+        if hasattr(torch, "compile"):
+            print(f"Compiling model with mode='{config.training.compile_mode}'...")
+            model = torch.compile(model, mode=config.training.compile_mode)
+            print("Model compiled successfully")
+        else:
+            print("Warning: torch.compile not available (requires PyTorch 2.0+)")
+
     # Create block diffusion process
     block_diffusion = BlockDiffusion(
         mask_token_id=config.model.mask_token_id,
@@ -193,6 +218,7 @@ def main():
     print(f"  Gradient accumulation: {config.training.gradient_accumulation_steps}")
     print(f"  Learning rate: {config.training.learning_rate}")
     print(f"  Mixed precision: {config.training.mixed_precision}")
+    print(f"  torch.compile: {config.training.compile} ({config.training.compile_mode})")
     print("=" * 50 + "\n")
 
     trainer.train()

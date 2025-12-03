@@ -42,6 +42,11 @@ training:
   mixed_precision: "bf16"
   gradient_checkpointing: false
   grad_clip: 1.0
+
+  # torch.compile (PyTorch 2.0+)
+  compile: false
+  compile_mode: "default"  # "default", "reduce-overhead", "max-autotune"
+
   log_every: 10
   save_every: 1000
   eval_every: 500
