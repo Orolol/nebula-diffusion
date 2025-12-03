@@ -1,0 +1,28 @@
+{
+  "os":  "Linux-5.15.153.1-microsoft-standard-WSL2-x86_64-with-glibc2.35",
+  "python":  "CPython 3.12.3",
+  "startedAt":  "2025-12-03T12:14:27.201067Z",
+  "args":  [
+    "--config",
+    "configs/tiny.yaml"
+  ],
+  "program":  "/home/gmartin/worspace/nebula-diffusion/scripts/train.py",
+  "codePath":  "scripts/train.py",
+  "codePathLocal":  "scripts/train.py",
+  "email":  "gaetan@0r0.fr",
+  "root":  "/home/gmartin/worspace/nebula-diffusion",
+  "host":  "FR003-L2902",
+  "executable":  "/home/gmartin/.pyenv/versions/nebula-env/bin/python",
+  "cpu_count":  4,
+  "cpu_count_logical":  8,
+  "disk":  {
+    "/":  {
+      "total":  "1081101176832",
+      "used":  "252375089152"
+    }
+  },
+  "memory":  {
+    "total":  "16634638336"
+  },
+  "writerId":  "kb2gh832rizls2i30u2llp17ritzxcvh"
+}

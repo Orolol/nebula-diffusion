@@ -1,0 +1,29 @@
+
+==================================================
+Starting training...
+  Max steps: 1000
+  Batch size: 8
+  Gradient accumulation: 1
+  Learning rate: 0.001
+  Mixed precision: bf16
+==================================================
+Training:   0%|                                                                                                                                                                                                  | 0/1000 [00:00<?, ?it/s]`trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'HuggingFaceFW/fineweb-edu' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+Resolving data files: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 2410/2410 [00:00<00:00, 32395.09it/s]
+Token indices sequence length is longer than the specified maximum sequence length for this model (1055 > 1024). Running this sequence through the model will result in indexing errors                          | 0/2410 [00:00<?, ?it/s]
+Training:  40%|██████████████████████████████████████████████████████████                                                                                      | 403/1000 [27:08<1:17:16,  7.77s/it, acc=0.0000, loss=8.5445, lr=7.48e-04]Traceback (most recent call last):
+  File "/home/gmartin/worspace/nebula-diffusion/scripts/train.py", line 202, in <module>
+    main()
+  File "/home/gmartin/worspace/nebula-diffusion/scripts/train.py", line 198, in main
+    trainer.train()
+  File "/home/gmartin/worspace/nebula-diffusion/src/nebula/training/trainer.py", line 248, in train
+    loss.backward()
+  File "/home/gmartin/.pyenv/versions/nebula-env/lib/python3.12/site-packages/torch/_tensor.py", line 625, in backward
+    torch.autograd.backward(
+  File "/home/gmartin/.pyenv/versions/nebula-env/lib/python3.12/site-packages/torch/autograd/__init__.py", line 354, in backward
+    _engine_run_backward(
+  File "/home/gmartin/.pyenv/versions/nebula-env/lib/python3.12/site-packages/torch/autograd/graph.py", line 841, in _engine_run_backward
+    return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt

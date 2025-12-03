@@ -1,0 +1,107 @@
+_wandb:
+    value:
+        cli_version: 0.23.1
+        e:
+            kb2gh832rizls2i30u2llp17ritzxcvh:
+                args:
+                    - --config
+                    - configs/tiny.yaml
+                codePath: scripts/train.py
+                codePathLocal: scripts/train.py
+                cpu_count: 4
+                cpu_count_logical: 8
+                disk:
+                    /:
+                        total: "1081101176832"
+                        used: "252375089152"
+                email: gaetan@0r0.fr
+                executable: /home/gmartin/.pyenv/versions/nebula-env/bin/python
+                host: FR003-L2902
+                memory:
+                    total: "16634638336"
+                os: Linux-5.15.153.1-microsoft-standard-WSL2-x86_64-with-glibc2.35
+                program: /home/gmartin/worspace/nebula-diffusion/scripts/train.py
+                python: CPython 3.12.3
+                root: /home/gmartin/worspace/nebula-diffusion
+                startedAt: "2025-12-03T12:14:27.201067Z"
+                writerId: kb2gh832rizls2i30u2llp17ritzxcvh
+        m: []
+        python_version: 3.12.3
+        t:
+            "1":
+                - 1
+                - 11
+                - 49
+                - 51
+                - 71
+            "2":
+                - 1
+                - 11
+                - 49
+                - 51
+                - 71
+            "3":
+                - 13
+                - 16
+                - 61
+            "4": 3.12.3
+            "5": 0.23.1
+            "6": 4.57.3
+            "12": 0.23.1
+            "13": linux-x86_64
+data:
+    value:
+        dataset_config: sample-10BT
+        dataset_name: HuggingFaceFW/fineweb-edu
+        max_seq_len: 128
+        num_workers: 0
+        prefetch_factor: 2
+diffusion:
+    value:
+        dus_confidence_threshold: 0.5
+        dus_kl_threshold: 0.1
+        dus_num_groups: 3
+        dus_use_kl: true
+        max_masking_ratio: 1
+        min_masking_ratio: 0
+        num_diffusion_steps: 32
+model:
+    value:
+        block_size: 8
+        deltanet_ratio: 0.75
+        dropout: 0.1
+        head_dim: 64
+        hidden_dim: 128
+        kv_latent_dim: 32
+        mask_token_id: 50257
+        max_seq_len: 128
+        mlp_ratio: 4
+        moe_capacity_factor: 1.25
+        moe_every_n_layers: 2
+        mtp_loss_weight: 0.1
+        mtp_num_tokens: 2
+        num_expert_slices: 4
+        num_experts: 4
+        num_heads: 2
+        num_layers: 4
+        use_moe: true
+        use_mtp: true
+        vocab_size: 50258
+training:
+    value:
+        batch_size: 8
+        checkpoint_dir: checkpoints/tiny
+        eval_every: 250
+        grad_clip: 1
+        gradient_accumulation_steps: 1
+        gradient_checkpointing: false
+        learning_rate: 0.001
+        log_every: 10
+        max_steps: 1000
+        mixed_precision: bf16
+        output_dir: outputs/tiny
+        save_every: 500
+        wandb_project: nebula-diffusion
+        wandb_run_name: tiny-hybrid
+        warmup_steps: 100
+        weight_decay: 0.1

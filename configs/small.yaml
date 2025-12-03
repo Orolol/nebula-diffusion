@@ -1,0 +1,72 @@
+# Small configuration (~25M params)
+# Hybrid architecture: 75% Gated DeltaNet + 25% MLA, Expert Choice MoE, Block Diffusion
+
+model:
+  vocab_size: 50258  # GPT-2 + [MASK]
+  hidden_dim: 256
+  num_layers: 8
+  num_heads: 4
+  head_dim: 64
+  mlp_ratio: 4.0
+  dropout: 0.1
+  max_seq_len: 256
+  mask_token_id: 50257
+
+  # Hybrid attention: 75% DeltaNet, 25% MLA
+  # For 8 layers: [deltanet, deltanet, mla, deltanet, deltanet, mla, deltanet, deltanet]
+  deltanet_ratio: 0.75
+  kv_latent_dim: 64  # MLA low-rank KV compression
+
+  # MoE: Expert Choice with nested experts
+  use_moe: true
+  num_experts: 8
+  num_expert_slices: 4
+  moe_capacity_factor: 1.25
+  moe_every_n_layers: 2  # MoE on layers 1, 3, 5, 7
+
+  # Block diffusion
+  block_size: 8
+
+  # MTP (Multi-Token Prediction)
+  use_mtp: true
+  mtp_num_tokens: 2
+  mtp_loss_weight: 0.1
+
+training:
+  batch_size: 16
+  gradient_accumulation_steps: 2
+  learning_rate: 5e-4
+  weight_decay: 0.1
+  warmup_steps: 500
+  max_steps: 10000
+  mixed_precision: "bf16"
+  gradient_checkpointing: false
+  grad_clip: 1.0
+  log_every: 10
+  save_every: 1000
+  eval_every: 500
+  wandb_project: "nebula-diffusion"
+  wandb_run_name: "small-hybrid"
+  output_dir: "outputs/small"
+  checkpoint_dir: "checkpoints/small"
+
+diffusion:
+  num_diffusion_steps: 64
+  min_masking_ratio: 0.0
+  max_masking_ratio: 1.0
+
+  # DUS (Dilated Unmasking Scheduler) for generation
+  dus_num_groups: 3
+  dus_confidence_threshold: 0.5
+  dus_use_kl: true
+  dus_kl_threshold: 0.1
+
+data:
+  dataset_name: "HuggingFaceFW/fineweb-edu"
+  dataset_config: "sample-10BT"
+  max_seq_len: 256
+  num_workers: 0
+  prefetch_factor: 2
+
+seed: 42
+device: "auto"

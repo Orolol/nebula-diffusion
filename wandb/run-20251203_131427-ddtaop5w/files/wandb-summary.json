@@ -1,0 +1,1 @@
+{"train/tokens":410624,"train/accuracy":0,"_wandb":{"runtime":1643},"train/masking_ratio":0.3505396544933319,"_runtime":1643.331952452,"_step":400,"_timestamp":1.7647656827267342e+09,"train/loss":8.544526100158691,"train/mtp_loss":0.7446039915084839,"train/learning_rate":0.0007484869805137777}
