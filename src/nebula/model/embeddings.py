@@ -25,6 +25,7 @@ class TokenEmbedding(nn.Module):
         Returns:
             embeddings: [batch_size, seq_len, hidden_dim]
         """
+        input_ids = input_ids.clone()
         return self.embedding(input_ids)
 
 

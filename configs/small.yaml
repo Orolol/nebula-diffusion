@@ -33,18 +33,18 @@ model:
   mtp_loss_weight: 0.1
 
 training:
-  batch_size: 16
+  batch_size: 32
   gradient_accumulation_steps: 2
   learning_rate: 5e-4
   weight_decay: 0.1
-  warmup_steps: 500
+  warmup_steps: 200
   max_steps: 10000
   mixed_precision: "bf16"
   gradient_checkpointing: false
   grad_clip: 1.0
 
   # torch.compile (PyTorch 2.0+)
-  compile: false
+  compile: true
   compile_mode: "default"  # "default", "reduce-overhead", "max-autotune"
 
   log_every: 10
@@ -57,8 +57,8 @@ training:
 
 diffusion:
   num_diffusion_steps: 64
-  min_masking_ratio: 0.0
-  max_masking_ratio: 1.0
+  min_masking_ratio: 0.15
+  max_masking_ratio: 0.90
 
   # DUS (Dilated Unmasking Scheduler) for generation
   dus_num_groups: 3

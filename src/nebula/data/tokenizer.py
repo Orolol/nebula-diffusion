@@ -19,6 +19,10 @@ class DiffusionTokenizer:
 
         # Set padding token to EOS (GPT-2 doesn't have a pad token by default)
         self.tokenizer.pad_token = self.tokenizer.eos_token
+        
+        # Suppress "Token indices sequence length is longer than the specified maximum sequence length" warning
+        # We handle chunking manually in the dataloader
+        self.tokenizer.model_max_length = 1_000_000_000
 
     @property
     def vocab_size(self) -> int:
@@ -85,3 +89,7 @@ class DiffusionTokenizer:
     def __len__(self) -> int:
         """Return vocabulary size."""
         return self.vocab_size
+
+    def __call__(self, *args, **kwargs):
+        """Make tokenizer callable, delegating to underlying tokenizer."""
+        return self.tokenizer(*args, **kwargs)

@@ -24,6 +24,15 @@ from nebula.model.block_diffusion import BlockDiffusion
 from nebula.training import Trainer, set_seed, get_device
 from nebula.training.utils import format_number
 
+# Enable TF32 for faster training on Ampere+ GPUs
+torch.set_float32_matmul_precision("high")
+torch.backends.cudnn.allow_tf32 = True
+
+# Suppress specific warnings
+import warnings
+warnings.filterwarnings("ignore", message="Online softmax is disabled.*")
+
+
 
 def load_config(config_path: str | None) -> Config:
     """Load configuration from YAML file or use defaults."""
@@ -164,7 +173,8 @@ def main():
         max_seq_len=config.data.max_seq_len,
         dataset_name=config.data.dataset_name,
         dataset_config=config.data.dataset_config,
-        num_workers=0,  # Use 0 for streaming datasets
+        num_workers=4,
+        prefetch_factor=4,
     )
 
     # Create hybrid model

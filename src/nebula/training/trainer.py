@@ -1,12 +1,14 @@
 """Training loop for hybrid diffusion language model with block diffusion."""
 
 import os
+import time
 from pathlib import Path
 from typing import Optional
 
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import autocast
+from torch.cuda.amp import GradScaler
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -79,7 +81,7 @@ class Trainer:
         self.use_amp = (
             self.train_config.mixed_precision != "no" and torch.cuda.is_available()
         )
-        self.scaler = GradScaler() if self.use_amp else None
+        self.scaler = torch.amp.GradScaler("cuda") if self.use_amp else None
 
         if self.train_config.mixed_precision == "bf16":
             self.autocast_dtype = torch.bfloat16
@@ -203,6 +205,8 @@ class Trainer:
             "loss": loss,
             "accuracy": accuracy.item(),
             "masking_ratio": block_batch["masking_ratio"].mean().item(),
+            "masking_ratio_min": block_batch["masking_ratio"].min().item(),
+            "masking_ratio_max": block_batch["masking_ratio"].max().item(),
             "num_masked": mask_indicator.sum().item(),
             "mtp_loss": result.get("mtp_loss", torch.tensor(0.0)).item(),
         }
@@ -226,6 +230,10 @@ class Trainer:
         accumulated_loss = 0.0
         accumulated_accuracy = 0.0
         accumulation_count = 0
+
+        # Tokens per second tracking
+        last_log_time = time.time()
+        last_log_tokens = self.total_tokens
 
         self.optimizer.zero_grad()
         data_iter = iter(self.train_loader)
@@ -277,12 +285,24 @@ class Trainer:
                 # Logging
                 if self.global_step % self.train_config.log_every == 0:
                     lr = self.scheduler.get_last_lr()[0]
+
+                    # Calculate tokens per second
+                    current_time = time.time()
+                    elapsed_time = current_time - last_log_time
+                    tokens_since_last_log = self.total_tokens - last_log_tokens
+                    tokens_per_second = tokens_since_last_log / elapsed_time if elapsed_time > 0 else 0
+                    last_log_time = current_time
+                    last_log_tokens = self.total_tokens
+
                     log_metrics = {
                         "train/loss": avg_loss,
                         "train/accuracy": avg_accuracy,
                         "train/learning_rate": lr,
                         "train/tokens": self.total_tokens,
+                        "train/tokens_per_second": tokens_per_second,
                         "train/masking_ratio": metrics["masking_ratio"],
+                        "train/masking_ratio_min": metrics.get("masking_ratio_min", 0.0),
+                        "train/masking_ratio_max": metrics.get("masking_ratio_max", 0.0),
                         "train/mtp_loss": metrics["mtp_loss"],
                     }
                     self._log_metrics(log_metrics, self.global_step)
@@ -290,6 +310,7 @@ class Trainer:
                     pbar.set_postfix(
                         loss=f"{avg_loss:.4f}",
                         acc=f"{avg_accuracy:.4f}",
+                        tps=f"{tokens_per_second:.0f}",
                         lr=f"{lr:.2e}",
                     )
 

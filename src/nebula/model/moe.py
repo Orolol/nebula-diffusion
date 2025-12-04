@@ -236,46 +236,58 @@ class ExpertChoiceMoE(nn.Module):
 
         # Capacity per expert
         capacity = int(num_tokens * self.capacity_factor / self.num_experts)
+        top_k = min(capacity, num_tokens)
+
+        # Batch topk for all experts at once: [num_experts, top_k]
+        top_weights_all, top_indices_all = router_weights.T.topk(top_k, dim=-1)
 
         # Initialize output
         output = torch.zeros_like(x_flat)
-        expert_counts = []
 
-        # Each expert selects top-k tokens
-        for expert_idx in range(self.num_experts):
-            expert_weights = router_weights[:, expert_idx]  # [num_tokens]
+        # During training, use full capacity (no nested slices) for speed
+        # Nested slices can be enabled for inference
+        use_nested = not self.training and self.num_slices > 1
 
-            # Select top tokens for this expert
-            top_k = min(capacity, num_tokens)
-            top_weights, top_indices = expert_weights.topk(top_k)
+        if use_nested:
+            # Slower path with nested slices for inference
+            for expert_idx in range(self.num_experts):
+                top_indices = top_indices_all[expert_idx]
+                top_weights = top_weights_all[expert_idx]
 
-            # Get inputs for this expert
-            expert_input = x_flat[top_indices]  # [capacity, hidden_dim]
-            expert_slice_indices = slice_indices[top_indices]  # [capacity]
+                expert_input = x_flat[top_indices]
+                expert_slice_indices = slice_indices[top_indices]
 
-            # Process through expert with appropriate slices
-            # For efficiency, group by slice index
-            expert_output = torch.zeros_like(expert_input)
+                expert_output = torch.zeros_like(expert_input)
 
-            for slice_idx in range(self.num_slices):
-                slice_mask = expert_slice_indices == slice_idx
-                if slice_mask.any():
-                    slice_input = expert_input[slice_mask]
-                    slice_output = self.experts[expert_idx](slice_input, slice_idx)
-                    expert_output[slice_mask] = slice_output
+                for slice_idx in range(self.num_slices):
+                    slice_mask = expert_slice_indices == slice_idx
+                    if slice_mask.any():
+                        slice_input = expert_input[slice_mask]
+                        slice_output = self.experts[expert_idx](slice_input, slice_idx)
+                        expert_output[slice_mask] = slice_output.to(expert_output.dtype)
 
-            # Scatter back with weighting
-            weighted_output = expert_output * top_weights.unsqueeze(-1)
-            output.index_add_(0, top_indices, weighted_output)
+                weighted_output = expert_output * top_weights.unsqueeze(-1)
+                output.index_add_(0, top_indices, weighted_output)
+        else:
+            # Fast path: process all experts with full capacity
+            # Gather inputs for all experts: [num_experts, top_k, hidden_dim]
+            expert_inputs = x_flat[top_indices_all]
 
-            expert_counts.append(top_k)
+            # Process each expert (can't fully vectorize due to different weights)
+            for expert_idx in range(self.num_experts):
+                expert_input = expert_inputs[expert_idx]  # [top_k, hidden_dim]
+                expert_output = self.experts[expert_idx](expert_input, slice_idx=None)  # Full capacity
+
+                # Weight and scatter
+                weighted_output = expert_output * top_weights_all[expert_idx].unsqueeze(-1)
+                output.index_add_(0, top_indices_all[expert_idx], weighted_output.to(output.dtype))
 
         # Reshape back
         output = rearrange(output, "(b s) d -> b s d", b=batch_size, s=seq_len)
 
         # Auxiliary info for logging
         aux_info = {
-            "expert_counts": torch.tensor(expert_counts),
+            "expert_counts": torch.tensor([top_k] * self.num_experts, device=x.device),
             "router_entropy": -(router_weights * (router_weights + 1e-8).log()).sum(),
             "slice_distribution": slice_probs.mean(dim=0),
         }

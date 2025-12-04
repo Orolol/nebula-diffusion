@@ -131,72 +131,56 @@ class BlockDiffusion:
         min_ratio: float = 0.0,
         max_ratio: float = 1.0,
     ) -> dict:
-        """Prepare a training batch with block-level masking.
+        """Prepare a training batch with random masking - fully vectorized.
 
-        For efficient training, we randomly select which block to train on
-        for each sequence, then mask that block while keeping context clean.
+        For efficient training, we mask a random fraction of ALL tokens.
+        The masking ratio determines what fraction of the ENTIRE sequence is masked,
+        providing substantial training signal per batch.
+
+        Note: This is standard masked LM training, not strict block diffusion.
+        Block structure is preserved for generation but not enforced during training.
 
         Args:
             input_ids: [batch, seq_len]
-            min_ratio: Minimum masking ratio
-            max_ratio: Maximum masking ratio
+            min_ratio: Minimum masking ratio (fraction of sequence to mask)
+            max_ratio: Maximum masking ratio (fraction of sequence to mask)
 
         Returns:
             Dictionary with:
-                - input_ids: Full sequence with one masked block per sample
+                - input_ids: Sequence with masked tokens
                 - target_ids: Original tokens
                 - mask_indicator: Which positions are masked
-                - block_indices: Which block was masked for each sample
+                - block_indices: Dummy block indices (for compatibility)
+                - masking_ratio: Actual masking ratio used
         """
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
 
-        # Split into blocks
-        blocks = self.split_into_blocks(input_ids)
-        num_blocks = len(blocks)
-
-        # Randomly select a block to mask for each sample
-        block_indices = torch.randint(0, num_blocks, (batch_size,), device=device)
-
-        # Sample masking ratios
+        # Sample masking ratios per sample (fraction of entire sequence)
         masking_ratio = self.sample_masking_ratio(batch_size, device, min_ratio, max_ratio)
 
-        # Build masked sequence
-        masked_blocks = []
-        mask_indicators = []
+        # Debug: Check masking ratio bounds
+        if (masking_ratio < 0.0).any() or (masking_ratio > 1.0).any():
+            print(f"WARNING: Invalid masking ratio detected! Min: {masking_ratio.min()}, Max: {masking_ratio.max()}")
+            masking_ratio = torch.clamp(masking_ratio, 0.0, 1.0)
 
-        for block_idx, block in enumerate(blocks):
-            # Which samples should have this block masked?
-            should_mask = block_indices == block_idx
+        # Generate random values for each position
+        rand = torch.rand(batch_size, seq_len, device=device)
 
-            # For samples that should have this block masked, apply masking
-            if should_mask.any():
-                masked_block = block.clone()
-                mask_indicator = torch.zeros_like(block, dtype=torch.bool)
+        # Mask positions where random < masking_ratio
+        mask_indicator = rand < masking_ratio.unsqueeze(1)
 
-                # Apply masking for selected samples
-                for sample_idx in should_mask.nonzero(as_tuple=True)[0]:
-                    ratio = masking_ratio[sample_idx]
-                    rand = torch.rand(self.block_size, device=device)
-                    sample_mask = rand < ratio
-                    masked_block[sample_idx, sample_mask] = self.mask_token_id
-                    mask_indicator[sample_idx] = sample_mask
+        # Create masked input
+        masked_input_ids = input_ids.clone()
+        masked_input_ids[mask_indicator] = self.mask_token_id
 
-                masked_blocks.append(masked_block)
-                mask_indicators.append(mask_indicator)
-            else:
-                # This block is context for all samples
-                masked_blocks.append(block)
-                mask_indicators.append(torch.zeros_like(block, dtype=torch.bool))
-
-        # Merge back
-        masked_input_ids = torch.cat(masked_blocks, dim=1)[:, :seq_len]
-        full_mask_indicator = torch.cat(mask_indicators, dim=1)[:, :seq_len]
+        # Dummy block indices for compatibility
+        block_indices = torch.zeros(batch_size, dtype=torch.long, device=device)
 
         return {
             "input_ids": masked_input_ids,
             "target_ids": input_ids,
-            "mask_indicator": full_mask_indicator,
+            "mask_indicator": mask_indicator,
             "block_indices": block_indices,
             "masking_ratio": masking_ratio,
         }
@@ -254,7 +238,7 @@ class BlockCausalMask:
         current_block_idx: int,
         device: torch.device,
     ) -> torch.Tensor:
-        """Create attention mask for block-level generation.
+        """Create attention mask for block-level generation - vectorized.
 
         Args:
             seq_len: Total sequence length (context + current block)
@@ -265,31 +249,34 @@ class BlockCausalMask:
             Attention mask [seq_len, seq_len]
             True means "can attend", False means "cannot attend"
         """
-        mask = torch.zeros(seq_len, seq_len, dtype=torch.bool, device=device)
+        # Create position indices
+        positions = torch.arange(seq_len, device=device)
+        block_ids = positions // self.block_size  # Which block each position belongs to
 
-        # Number of context blocks
+        # Row and column block indices
+        row_blocks = block_ids.unsqueeze(1)  # [seq_len, 1]
+        col_blocks = block_ids.unsqueeze(0)  # [1, seq_len]
+
         num_context_blocks = current_block_idx
         context_len = num_context_blocks * self.block_size
 
-        # Context can attend to itself (bidirectionally within each completed block)
-        for b in range(num_context_blocks):
-            start = b * self.block_size
-            end = (b + 1) * self.block_size
-            mask[start:end, start:end] = True
+        # Context positions (completed blocks)
+        is_context_row = positions.unsqueeze(1) < context_len
+        is_context_col = positions.unsqueeze(0) < context_len
 
-        # Context blocks can attend to all previous blocks
-        for b in range(num_context_blocks):
-            for prev_b in range(b):
-                curr_start, curr_end = b * self.block_size, (b + 1) * self.block_size
-                prev_start, prev_end = prev_b * self.block_size, (prev_b + 1) * self.block_size
-                mask[curr_start:curr_end, prev_start:prev_end] = True
+        # Within same block (bidirectional)
+        same_block = row_blocks == col_blocks
 
-        # Current block can attend to all context
-        if context_len < seq_len:
-            mask[context_len:, :context_len] = True
+        # Context can attend to same or earlier blocks (causal at block level)
+        context_causal = (row_blocks >= col_blocks) & is_context_row & is_context_col
 
-            # Current block has bidirectional attention within itself
-            mask[context_len:, context_len:] = True
+        # Current block can attend to all context and itself
+        is_current_row = ~is_context_row.squeeze(1)
+        current_to_context = is_current_row.unsqueeze(1) & is_context_col
+        current_bidirectional = is_current_row.unsqueeze(1) & (~is_context_col)
+
+        # Combine masks
+        mask = same_block | context_causal | current_to_context | current_bidirectional
 
         return mask
 
@@ -299,7 +286,7 @@ class BlockCausalMask:
         block_indices: torch.Tensor,
         device: torch.device,
     ) -> torch.Tensor:
-        """Create per-sample training masks.
+        """Create per-sample training masks - vectorized.
 
         During training, each sample may have a different block being trained.
 
@@ -312,11 +299,40 @@ class BlockCausalMask:
             [batch, seq_len, seq_len] attention masks
         """
         batch_size = block_indices.shape[0]
-        masks = []
 
-        for i in range(batch_size):
-            block_idx = block_indices[i].item()
-            mask = self.create_mask(seq_len, block_idx, device)
-            masks.append(mask)
+        # Create position indices
+        positions = torch.arange(seq_len, device=device)
+        block_ids = positions // self.block_size  # [seq_len]
 
-        return torch.stack(masks)
+        # Row and column block indices: [1, seq_len, 1] and [1, 1, seq_len]
+        row_blocks = block_ids.view(1, seq_len, 1)
+        col_blocks = block_ids.view(1, 1, seq_len)
+
+        # Context lengths per sample: [batch, 1, 1]
+        context_lens = (block_indices * self.block_size).view(batch_size, 1, 1)
+
+        # Position grids
+        row_positions = positions.view(1, seq_len, 1)  # [1, seq_len, 1]
+        col_positions = positions.view(1, 1, seq_len)  # [1, 1, seq_len]
+
+        # Context masks per sample
+        is_context_row = row_positions < context_lens  # [batch, seq_len, 1]
+        is_context_col = col_positions < context_lens  # [batch, 1, seq_len]
+
+        # Same block (bidirectional within block)
+        same_block = row_blocks == col_blocks  # [1, seq_len, seq_len]
+
+        # Context causal at block level
+        context_causal = (row_blocks >= col_blocks) & is_context_row & is_context_col
+
+        # Current block to context
+        is_current_row = ~is_context_row  # [batch, seq_len, 1]
+        current_to_context = is_current_row & is_context_col
+
+        # Current block bidirectional
+        current_bidirectional = is_current_row & (~is_context_col)
+
+        # Combine
+        mask = same_block | context_causal | current_to_context | current_bidirectional
+
+        return mask

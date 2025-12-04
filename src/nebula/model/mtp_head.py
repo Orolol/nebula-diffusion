@@ -104,13 +104,14 @@ class MultiTokenPredictionHead(nn.Module):
             h = self.projection(hidden_states)
         else:
             h = hidden_states
+        h = h.clone()
 
         # Predict each future token
         all_logits = []
 
         for token_idx in range(self.num_tokens):
             # Add position-specific offset
-            h_offset = h + self.position_offsets[token_idx]
+            h_offset = h.clone() + self.position_offsets[token_idx]
 
             # Get logits for this future position
             logits = self.heads[token_idx](h_offset)  # [batch, seq, vocab]
