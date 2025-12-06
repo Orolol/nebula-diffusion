@@ -19,7 +19,7 @@ import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
 from ..config import ModelConfig
-from .embeddings import TokenEmbedding, SinusoidalPositionalEncoding
+from .embeddings import TokenEmbedding, RMSNorm, SwiGLU
 from .gated_deltanet import GatedDeltaNet
 from .mla_attention import MultiHeadLatentAttention
 from .moe import ExpertChoiceMoE
@@ -42,22 +42,24 @@ class HybridTransformerBlock(nn.Module):
         num_expert_slices: int = 4,
         moe_capacity_factor: float = 1.25,
         dropout: float = 0.0,
+        max_seq_len: int = 2048,
     ):
         super().__init__()
 
         self.attention_type = attention_type
         self.use_moe = use_moe
 
-        # Pre-norm for attention
-        self.norm1 = nn.LayerNorm(hidden_dim)
+        # Pre-norm for attention (RMSNorm is faster than LayerNorm)
+        self.norm1 = RMSNorm(hidden_dim)
 
-        # Attention layer (DeltaNet or MLA)
+        # Attention layer (DeltaNet or MLA) with RoPE
         if attention_type == "deltanet":
             self.attn = GatedDeltaNet(
                 hidden_dim=hidden_dim,
                 num_heads=num_heads,
                 head_dim=head_dim,
                 dropout=dropout,
+                max_seq_len=max_seq_len,
             )
         else:
             self.attn = MultiHeadLatentAttention(
@@ -66,14 +68,16 @@ class HybridTransformerBlock(nn.Module):
                 head_dim=head_dim,
                 kv_latent_dim=kv_latent_dim,
                 dropout=dropout,
+                max_seq_len=max_seq_len,
             )
 
         # Pre-norm for FFN
-        self.norm2 = nn.LayerNorm(hidden_dim)
+        self.norm2 = RMSNorm(hidden_dim)
 
-        # FFN: MoE or standard MLP
+        # FFN: MoE or SwiGLU MLP
+        # For SwiGLU, we use 2/3 of the intermediate dim to match param count
         if use_moe:
-            intermediate_dim = int(hidden_dim * mlp_ratio)
+            intermediate_dim = int(hidden_dim * mlp_ratio * 2 / 3)
             self.ffn = ExpertChoiceMoE(
                 hidden_dim=hidden_dim,
                 intermediate_dim=intermediate_dim,
@@ -83,13 +87,12 @@ class HybridTransformerBlock(nn.Module):
                 dropout=dropout,
             )
         else:
-            intermediate_dim = int(hidden_dim * mlp_ratio)
-            self.ffn = nn.Sequential(
-                nn.Linear(hidden_dim, intermediate_dim),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(intermediate_dim, hidden_dim),
-                nn.Dropout(dropout),
+            # SwiGLU with adjusted intermediate dim
+            intermediate_dim = int(hidden_dim * mlp_ratio * 2 / 3)
+            self.ffn = SwiGLU(
+                hidden_dim=hidden_dim,
+                intermediate_dim=intermediate_dim,
+                dropout=dropout,
             )
 
     def forward(
@@ -148,13 +151,9 @@ class HybridDiffusionTransformer(nn.Module):
         super().__init__()
         self.config = config
 
-        # Embeddings
+        # Embeddings (RoPE is now applied inside attention layers)
         self.token_embed = TokenEmbedding(config.vocab_size, config.hidden_dim)
-        self.pos_embed = SinusoidalPositionalEncoding(
-            config.hidden_dim,
-            config.max_seq_len,
-            dropout=config.dropout,
-        )
+        self.embed_dropout = nn.Dropout(config.dropout)
 
         # Get layer configurations
         layer_types = config.get_layer_types()
@@ -175,12 +174,17 @@ class HybridDiffusionTransformer(nn.Module):
                 num_expert_slices=config.num_expert_slices,
                 moe_capacity_factor=config.moe_capacity_factor,
                 dropout=config.dropout,
+                max_seq_len=config.max_seq_len,
             )
             self.layers.append(block)
 
         # Output
-        self.final_norm = nn.LayerNorm(config.hidden_dim)
+        self.final_norm = RMSNorm(config.hidden_dim)
         self.lm_head = nn.Linear(config.hidden_dim, config.vocab_size, bias=False)
+
+        # Tie embeddings: share weights between input embedding and output projection
+        # This reduces parameters and improves training
+        self.lm_head.weight = self.token_embed.embedding.weight
 
         # MTP head (optional)
         self.mtp_head = None
@@ -191,7 +195,7 @@ class HybridDiffusionTransformer(nn.Module):
                 num_tokens=config.mtp_num_tokens,
             )
 
-        # Initialize
+        # Initialize (don't re-init lm_head since it's tied)
         self._init_weights()
 
         # Gradient checkpointing flag
@@ -229,9 +233,9 @@ class HybridDiffusionTransformer(nn.Module):
         """
         batch_size, seq_len = input_ids.shape
 
-        # Embed tokens and add positional encoding
+        # Embed tokens (RoPE is applied in attention layers)
         x = self.token_embed(input_ids)
-        x = self.pos_embed(x)
+        x = self.embed_dropout(x)
 
         # Create position indices for MoE spatial bias
         positions = torch.arange(seq_len, device=input_ids.device)
@@ -272,6 +276,32 @@ class HybridDiffusionTransformer(nn.Module):
     def get_logits(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Convenience method to get just logits."""
         return self.forward(input_ids)["logits"]
+
+    @torch.no_grad()
+    def generate_forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Optimized forward for generation - returns only logits.
+
+        Skips MTP, aux info collection, and uses inference mode.
+        """
+        batch_size, seq_len = input_ids.shape
+
+        # Embed tokens
+        x = self.token_embed(input_ids)
+        # Skip dropout during generation
+
+        # Create position indices
+        positions = torch.arange(seq_len, device=input_ids.device)
+        positions = positions.unsqueeze(0).expand(batch_size, -1)
+
+        # Pass through transformer blocks (skip aux info)
+        for layer in self.layers:
+            x, _ = layer(x, None, positions)
+
+        # Final norm and LM head
+        x = self.final_norm(x)
+        logits = self.lm_head(x)
+
+        return logits
 
     def count_parameters(self) -> int:
         """Count total trainable parameters."""

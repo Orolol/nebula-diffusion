@@ -3,7 +3,7 @@
 from .transformer import HybridDiffusionTransformer, DiffusionTransformer
 from .gated_deltanet import GatedDeltaNet, GatedDeltaNetBlock
 from .mla_attention import MultiHeadLatentAttention, MLABlock
-from .moe import ExpertChoiceMoE, NestedExpert, MoEBlock
+from .moe import ExpertChoiceMoE, BatchedExperts, MoEBlock
 from .embeddings import TokenEmbedding, SinusoidalPositionalEncoding
 from .block_diffusion import BlockDiffusion, BlockCausalMask
 from .mtp_head import MultiTokenPredictionHead, MTPAuxiliaryLoss
@@ -19,7 +19,7 @@ __all__ = [
     "MLABlock",
     # MoE
     "ExpertChoiceMoE",
-    "NestedExpert",
+    "BatchedExperts",
     "MoEBlock",
     # Embeddings
     "TokenEmbedding",

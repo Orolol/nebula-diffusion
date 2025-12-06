@@ -8,8 +8,35 @@ Trains the hybrid architecture:
 - MTP auxiliary loss
 """
 
-import argparse
+# ============================================================================
+# CRITICAL: Set environment variables BEFORE importing torch
+# ============================================================================
+import os
 from pathlib import Path
+
+# torch.compile optimizations - MUST be set before torch import
+num_cpus = os.cpu_count() or 1
+os.environ["TORCH_COMPILE_THREADS"] = str(num_cpus)
+os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = str(num_cpus)
+
+# Enable persistent cache for compiled models (avoid recompilation)
+cache_dir = Path.home() / ".cache" / "torch_compile"
+cache_dir.mkdir(parents=True, exist_ok=True)
+os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(cache_dir)
+os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "1"
+
+# Reduce recompilation with dynamic shapes
+os.environ["TORCHDYNAMO_DYNAMIC_SHAPES"] = "1"
+
+# Optimize CUDA operations
+os.environ["CUDA_LAUNCH_BLOCKING"] = "0"  # Async CUDA operations
+os.environ["TORCH_CUDNN_V8_API_ENABLED"] = "1"  # Use cuDNN v8 API
+
+# ============================================================================
+# Now import torch and other modules
+# ============================================================================
+import argparse
+import warnings
 
 import torch
 from omegaconf import OmegaConf
@@ -27,9 +54,12 @@ from nebula.training.utils import format_number
 # Enable TF32 for faster training on Ampere+ GPUs
 torch.set_float32_matmul_precision("high")
 torch.backends.cudnn.allow_tf32 = True
+torch.backends.cuda.matmul.allow_tf32 = True
+
+# Enable cudnn benchmarking for consistent input sizes
+torch.backends.cudnn.benchmark = True
 
 # Suppress specific warnings
-import warnings
 warnings.filterwarnings("ignore", message="Online softmax is disabled.*")
 
 
@@ -198,8 +228,17 @@ def main():
     if config.training.compile:
         if hasattr(torch, "compile"):
             print(f"Compiling model with mode='{config.training.compile_mode}'...")
-            model = torch.compile(model, mode=config.training.compile_mode)
-            print("Model compiled successfully")
+            print(f"  Using {num_cpus} CPU threads for compilation")
+            print(f"  Cache directory: {cache_dir}")
+
+            # Use dynamic=True to reduce recompilations with varying sequence lengths
+            model = torch.compile(
+                model,
+                mode=config.training.compile_mode,
+                dynamic=True,  # Handle dynamic shapes without recompilation
+                fullgraph=False,  # Allow graph breaks for compatibility
+            )
+            print("Model compiled successfully (lazy compilation on first forward pass)")
         else:
             print("Warning: torch.compile not available (requires PyTorch 2.0+)")
 

@@ -17,102 +17,83 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange
+from einops import rearrange, einsum
+
+from .embeddings import RMSNorm
 
 
-class NestedExpert(nn.Module):
-    """Single nested expert with multiple compute slices.
+class BatchedExperts(nn.Module):
+    """Batched experts with SwiGLU for efficient parallel computation.
 
-    Following MoNE, the expert parameters are organized along an
-    increasing compute-accuracy curve. Easy tokens use smaller slices,
-    hard tokens use larger slices.
+    All experts share the same architecture but have independent weights.
+    Uses batched matmuls instead of loops for GPU efficiency.
     """
 
     def __init__(
         self,
+        num_experts: int,
         hidden_dim: int,
         intermediate_dim: int,
-        num_slices: int = 4,
         dropout: float = 0.0,
     ):
-        """
-        Args:
-            hidden_dim: Input/output dimension
-            intermediate_dim: Maximum intermediate dimension
-            num_slices: Number of nested slices (compute levels)
-            dropout: Dropout probability
-        """
         super().__init__()
 
+        self.num_experts = num_experts
         self.hidden_dim = hidden_dim
         self.intermediate_dim = intermediate_dim
-        self.num_slices = num_slices
 
-        # Compute slice boundaries
-        # Slice i uses intermediate_dim * (i+1) / num_slices
-        self.slice_sizes = [
-            int(intermediate_dim * (i + 1) / num_slices)
-            for i in range(num_slices)
-        ]
+        # Batched weights for all experts: [num_experts, out_dim, in_dim]
+        # SwiGLU: gate, up, down projections
+        self.w_gate = nn.Parameter(torch.empty(num_experts, intermediate_dim, hidden_dim))
+        self.w_up = nn.Parameter(torch.empty(num_experts, intermediate_dim, hidden_dim))
+        self.w_down = nn.Parameter(torch.empty(num_experts, hidden_dim, intermediate_dim))
 
-        # Full-sized projections (we'll slice into them)
-        self.fc1 = nn.Linear(hidden_dim, intermediate_dim)
-        self.fc2 = nn.Linear(intermediate_dim, hidden_dim)
         self.dropout = nn.Dropout(dropout)
-
         self._init_weights()
 
     def _init_weights(self):
-        nn.init.normal_(self.fc1.weight, mean=0.0, std=0.02)
-        nn.init.normal_(self.fc2.weight, mean=0.0, std=0.02)
-        nn.init.zeros_(self.fc1.bias)
-        nn.init.zeros_(self.fc2.bias)
+        for w in [self.w_gate, self.w_up, self.w_down]:
+            nn.init.normal_(w, mean=0.0, std=0.02)
 
     def forward(
         self,
         x: torch.Tensor,
-        slice_idx: Optional[int] = None,
+        expert_indices: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Forward pass using specified slice.
+        Forward pass with batched expert computation.
 
         Args:
-            x: Input tensor [batch, hidden_dim]
-            slice_idx: Which slice to use (0=smallest, num_slices-1=largest)
-                      If None, uses full capacity
+            x: Input tensor [num_experts, capacity, hidden_dim]
+            expert_indices: Not used, for API compatibility
 
         Returns:
-            Output tensor [batch, hidden_dim]
+            Output tensor [num_experts, capacity, hidden_dim]
         """
-        if slice_idx is None:
-            slice_size = self.intermediate_dim
-        else:
-            slice_idx = min(slice_idx, self.num_slices - 1)
-            slice_size = self.slice_sizes[slice_idx]
+        # x: [E, C, D] where E=num_experts, C=capacity, D=hidden_dim
+        # w_gate, w_up: [E, I, D] where I=intermediate_dim
+        # w_down: [E, D, I]
 
-        # Use sliced weights for efficiency
-        h = F.linear(x, self.fc1.weight[:slice_size], self.fc1.bias[:slice_size])
-        h = F.gelu(h)
+        # Batched matmul: [E, C, D] @ [E, D, I] -> [E, C, I]
+        gate = torch.bmm(x, self.w_gate.transpose(1, 2))  # [E, C, I]
+        up = torch.bmm(x, self.w_up.transpose(1, 2))      # [E, C, I]
+
+        # SwiGLU activation
+        h = F.silu(gate) * up  # [E, C, I]
         h = self.dropout(h)
-        h = F.linear(h, self.fc2.weight[:, :slice_size], self.fc2.bias)
-        h = self.dropout(h)
 
-        return h
+        # Down projection: [E, C, I] @ [E, I, D] -> [E, C, D]
+        out = torch.bmm(h, self.w_down.transpose(1, 2))   # [E, C, D]
 
-    def get_flops(self, slice_idx: int) -> int:
-        """Get FLOPs for a given slice."""
-        slice_size = self.slice_sizes[min(slice_idx, self.num_slices - 1)]
-        # fc1: hidden_dim * slice_size
-        # fc2: slice_size * hidden_dim
-        return 2 * self.hidden_dim * slice_size
+        return out
 
 
 class ExpertChoiceMoE(nn.Module):
-    """Expert Choice MoE with nested experts and ReLU routing.
+    """Expert Choice MoE with batched experts and ReLU routing.
 
     Key features:
     - Expert Choice: experts select tokens (perfect load balancing)
-    - Nested Experts: variable compute per token
+    - Batched computation: all experts run in parallel via batched matmuls
     - ReLU Routing: fully differentiable (no TopK discontinuity)
     - Spatial Preferences: experts develop positional specialization
     """
@@ -122,45 +103,33 @@ class ExpertChoiceMoE(nn.Module):
         hidden_dim: int,
         intermediate_dim: int,
         num_experts: int = 8,
-        num_slices: int = 4,
+        num_slices: int = 4,  # Kept for API compatibility, not used in batched version
         capacity_factor: float = 1.25,
         use_relu_routing: bool = True,
         enable_spatial_bias: bool = True,
         max_seq_len: int = 2048,
         dropout: float = 0.0,
     ):
-        """
-        Args:
-            hidden_dim: Input/output dimension
-            intermediate_dim: Expert intermediate dimension
-            num_experts: Number of experts
-            num_slices: Number of nested slices per expert
-            capacity_factor: Expert capacity as factor of uniform distribution
-            use_relu_routing: Use ReLU (ReMoE) vs softmax routing
-            enable_spatial_bias: Learn positional biases for experts
-            max_seq_len: Maximum sequence length for spatial bias
-            dropout: Dropout probability
-        """
         super().__init__()
 
         self.hidden_dim = hidden_dim
         self.num_experts = num_experts
-        self.num_slices = num_slices
         self.capacity_factor = capacity_factor
         self.use_relu_routing = use_relu_routing
         self.enable_spatial_bias = enable_spatial_bias
 
-        # Create nested experts
-        self.experts = nn.ModuleList([
-            NestedExpert(hidden_dim, intermediate_dim, num_slices, dropout)
-            for _ in range(num_experts)
-        ])
+        # Batched experts for efficient parallel computation
+        self.experts = BatchedExperts(
+            num_experts=num_experts,
+            hidden_dim=hidden_dim,
+            intermediate_dim=intermediate_dim,
+            dropout=dropout,
+        )
 
         # Router projection
         self.router = nn.Linear(hidden_dim, num_experts, bias=False)
 
         # Spatial positional bias (learnable)
-        # Each expert learns which positions it prefers
         if enable_spatial_bias:
             self.spatial_bias = nn.Parameter(
                 torch.zeros(num_experts, max_seq_len)
@@ -168,15 +137,10 @@ class ExpertChoiceMoE(nn.Module):
         else:
             self.spatial_bias = None
 
-        # Slice selector (predicts which slice to use based on difficulty)
-        self.slice_predictor = nn.Linear(hidden_dim, num_slices)
-
         self._init_weights()
 
     def _init_weights(self):
         nn.init.normal_(self.router.weight, mean=0.0, std=0.02)
-        nn.init.normal_(self.slice_predictor.weight, mean=0.0, std=0.02)
-        nn.init.zeros_(self.slice_predictor.bias)
 
     def forward(
         self,
@@ -184,7 +148,7 @@ class ExpertChoiceMoE(nn.Module):
         positions: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, dict]:
         """
-        Forward pass with Expert Choice routing.
+        Forward pass with Expert Choice routing and batched computation.
 
         Args:
             x: Input tensor [batch, seq_len, hidden_dim]
@@ -205,91 +169,54 @@ class ExpertChoiceMoE(nn.Module):
 
         # Add spatial bias if enabled
         if self.spatial_bias is not None:
-            # Create position indices if not provided
             if positions is None:
                 positions = torch.arange(seq_len, device=x.device)
                 positions = positions.unsqueeze(0).expand(batch_size, -1)
 
-            # Flatten positions
-            pos_flat = positions.reshape(-1)  # [num_tokens]
-            pos_flat = pos_flat.clamp(0, self.spatial_bias.shape[1] - 1)
-
-            # Add spatial bias: [num_tokens, num_experts]
+            pos_flat = positions.reshape(-1).clamp(0, self.spatial_bias.shape[1] - 1)
             spatial_bias = self.spatial_bias[:, pos_flat].T
             router_logits = router_logits + spatial_bias
 
-        # Predict slice difficulty
-        slice_logits = self.slice_predictor(x_flat)  # [num_tokens, num_slices]
-        slice_probs = F.softmax(slice_logits, dim=-1)
-        slice_indices = slice_probs.argmax(dim=-1)  # [num_tokens]
-
         # Expert Choice routing: softmax over TOKENS for each expert
-        # This means each expert selects which tokens to process
         if self.use_relu_routing:
-            # ReMoE: ReLU activation for fully differentiable routing
             router_weights = F.relu(router_logits)
-            # Normalize per expert
             router_weights = router_weights / (router_weights.sum(dim=0, keepdim=True) + 1e-6)
         else:
-            # Standard softmax over tokens (Expert Choice)
-            router_weights = F.softmax(router_logits, dim=0)  # Softmax over tokens!
+            router_weights = F.softmax(router_logits, dim=0)
 
         # Capacity per expert
         capacity = int(num_tokens * self.capacity_factor / self.num_experts)
-        top_k = min(capacity, num_tokens)
+        capacity = min(capacity, num_tokens)
 
-        # Batch topk for all experts at once: [num_experts, top_k]
-        top_weights_all, top_indices_all = router_weights.T.topk(top_k, dim=-1)
+        # Get top-k tokens for each expert: [num_experts, capacity]
+        top_weights, top_indices = router_weights.T.topk(capacity, dim=-1)
 
-        # Initialize output
+        # Gather inputs for all experts: [num_experts, capacity, hidden_dim]
+        expert_inputs = x_flat[top_indices]  # Advanced indexing
+
+        # Batched forward through all experts at once
+        expert_outputs = self.experts(expert_inputs, None)  # [E, C, D]
+
+        # Apply routing weights: [E, C, D] * [E, C, 1] -> [E, C, D]
+        weighted_outputs = expert_outputs * top_weights.unsqueeze(-1)
+
+        # Scatter back to original positions
+        # Use scatter_add for efficiency
         output = torch.zeros_like(x_flat)
 
-        # During training, use full capacity (no nested slices) for speed
-        # Nested slices can be enabled for inference
-        use_nested = not self.training and self.num_slices > 1
+        # Flatten expert dimension for scatter
+        flat_indices = top_indices.reshape(-1)  # [E * C]
+        flat_outputs = weighted_outputs.reshape(-1, hidden_dim)  # [E * C, D]
 
-        if use_nested:
-            # Slower path with nested slices for inference
-            for expert_idx in range(self.num_experts):
-                top_indices = top_indices_all[expert_idx]
-                top_weights = top_weights_all[expert_idx]
-
-                expert_input = x_flat[top_indices]
-                expert_slice_indices = slice_indices[top_indices]
-
-                expert_output = torch.zeros_like(expert_input)
-
-                for slice_idx in range(self.num_slices):
-                    slice_mask = expert_slice_indices == slice_idx
-                    if slice_mask.any():
-                        slice_input = expert_input[slice_mask]
-                        slice_output = self.experts[expert_idx](slice_input, slice_idx)
-                        expert_output[slice_mask] = slice_output.to(expert_output.dtype)
-
-                weighted_output = expert_output * top_weights.unsqueeze(-1)
-                output.index_add_(0, top_indices, weighted_output)
-        else:
-            # Fast path: process all experts with full capacity
-            # Gather inputs for all experts: [num_experts, top_k, hidden_dim]
-            expert_inputs = x_flat[top_indices_all]
-
-            # Process each expert (can't fully vectorize due to different weights)
-            for expert_idx in range(self.num_experts):
-                expert_input = expert_inputs[expert_idx]  # [top_k, hidden_dim]
-                expert_output = self.experts[expert_idx](expert_input, slice_idx=None)  # Full capacity
-
-                # Weight and scatter
-                weighted_output = expert_output * top_weights_all[expert_idx].unsqueeze(-1)
-                output.index_add_(0, top_indices_all[expert_idx], weighted_output.to(output.dtype))
+        # Scatter add (handles overlapping indices correctly)
+        output.scatter_add_(0, flat_indices.unsqueeze(-1).expand(-1, hidden_dim), flat_outputs)
 
         # Reshape back
         output = rearrange(output, "(b s) d -> b s d", b=batch_size, s=seq_len)
 
         # Auxiliary info for logging
         aux_info = {
-            "expert_counts": torch.tensor([top_k] * self.num_experts, device=x.device),
             "router_entropy": -(router_weights * (router_weights + 1e-8).log()).sum(),
-            "slice_distribution": slice_probs.mean(dim=0),
         }
 
         return output, aux_info
@@ -307,30 +234,17 @@ class MoEBlock(nn.Module):
         intermediate_dim: Optional[int] = None,
         num_slices: int = 4,
         capacity_factor: float = 1.25,
-        attention_type: str = "deltanet",  # "deltanet" or "mla"
+        attention_type: str = "deltanet",
         kv_latent_dim: int = 64,
         dropout: float = 0.0,
     ):
-        """
-        Args:
-            hidden_dim: Model dimension
-            num_heads: Number of attention heads
-            head_dim: Dimension per head
-            num_experts: Number of experts
-            intermediate_dim: Expert FFN dimension (default: 4 * hidden_dim)
-            num_slices: Number of nested slices
-            capacity_factor: Expert capacity factor
-            attention_type: Type of attention to use
-            kv_latent_dim: Latent dim for MLA attention
-            dropout: Dropout probability
-        """
         super().__init__()
 
         if intermediate_dim is None:
             intermediate_dim = 4 * hidden_dim
 
         # Attention layer
-        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.norm1 = RMSNorm(hidden_dim)
 
         if attention_type == "deltanet":
             from .gated_deltanet import GatedDeltaNet
@@ -353,7 +267,7 @@ class MoEBlock(nn.Module):
         self.attention_type = attention_type
 
         # MoE FFN layer
-        self.norm2 = nn.LayerNorm(hidden_dim)
+        self.norm2 = RMSNorm(hidden_dim)
         self.moe = ExpertChoiceMoE(
             hidden_dim=hidden_dim,
             intermediate_dim=intermediate_dim,
@@ -369,16 +283,6 @@ class MoEBlock(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         positions: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, dict]:
-        """
-        Args:
-            x: Input [batch, seq_len, hidden_dim]
-            attention_mask: Optional mask
-            positions: Optional position indices
-
-        Returns:
-            output: [batch, seq_len, hidden_dim]
-            aux_info: MoE routing statistics
-        """
         # Attention
         if self.attention_type == "deltanet":
             attn_out, _ = self.attn(self.norm1(x))

@@ -14,6 +14,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+from .embeddings import RotaryPositionalEmbedding
+
 
 class MultiHeadLatentAttention(nn.Module):
     """Multi-head Latent Attention with low-rank KV compression.
@@ -33,6 +35,7 @@ class MultiHeadLatentAttention(nn.Module):
         kv_latent_dim: int = 64,
         q_latent_dim: Optional[int] = None,
         dropout: float = 0.0,
+        max_seq_len: int = 2048,
     ):
         """
         Args:
@@ -42,6 +45,7 @@ class MultiHeadLatentAttention(nn.Module):
             kv_latent_dim: Latent dimension for KV compression
             q_latent_dim: Optional latent dimension for Q (if None, no compression)
             dropout: Dropout probability
+            max_seq_len: Maximum sequence length for RoPE
         """
         super().__init__()
 
@@ -72,7 +76,9 @@ class MultiHeadLatentAttention(nn.Module):
         # Output projection
         self.out_proj = nn.Linear(num_heads * head_dim, hidden_dim, bias=False)
 
-        # RoPE can be added here if positional encoding is needed in attention
+        # RoPE for positional encoding
+        self.rope = RotaryPositionalEmbedding(head_dim, max_seq_len)
+
         self.dropout = nn.Dropout(dropout)
 
         self._init_weights()
@@ -124,6 +130,10 @@ class MultiHeadLatentAttention(nn.Module):
 
         k = rearrange(k, "b s (h d) -> b h s d", h=self.num_heads)
         v = rearrange(v, "b s (h d) -> b h s d", h=self.num_heads)
+
+        # Apply RoPE to Q and K
+        kv_seq_len = k.shape[2]
+        q, k = self.rope(q, k, kv_seq_len)
 
         # Prepare attention mask if provided
         attn_mask = None

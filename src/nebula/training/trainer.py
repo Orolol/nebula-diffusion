@@ -17,6 +17,7 @@ from ..config import Config, TrainingConfig, DiffusionConfig
 from ..model.block_diffusion import BlockDiffusion
 from ..model.transformer import HybridDiffusionTransformer
 from .utils import save_checkpoint, format_number
+from .muon import Muon
 
 
 def get_cosine_schedule_with_warmup(
@@ -61,14 +62,27 @@ class Trainer:
         self.diff_config = config.diffusion
         self.model_config = config.model
 
-        # Setup optimizer
-        self.optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=self.train_config.learning_rate,
-            betas=(0.9, 0.95),
-            weight_decay=self.train_config.weight_decay,
-            eps=1e-8,
-        )
+        # Setup optimizer (Muon for faster convergence)
+        optimizer_type = getattr(self.train_config, 'optimizer', 'muon')
+        if optimizer_type == 'muon':
+            self.optimizer = Muon(
+                model.parameters(),
+                lr=self.train_config.learning_rate,
+                momentum=0.95,
+                nesterov=True,
+                ns_steps=5,
+                adamw_lr=self.train_config.learning_rate * 0.1,
+                adamw_betas=(0.9, 0.95),
+                adamw_wd=self.train_config.weight_decay,
+            )
+        else:
+            self.optimizer = torch.optim.AdamW(
+                model.parameters(),
+                lr=self.train_config.learning_rate,
+                betas=(0.9, 0.95),
+                weight_decay=self.train_config.weight_decay,
+                eps=1e-8,
+            )
 
         # Setup scheduler
         self.scheduler = get_cosine_schedule_with_warmup(
@@ -149,12 +163,12 @@ class Trainer:
         """Execute a single training step with block diffusion.
 
         Args:
-            batch: Dictionary with 'input_ids' tensor
+            batch: Dictionary with 'input_ids' tensor (already on device)
 
         Returns:
-            Dictionary with loss and metrics
+            Dictionary with loss and metrics (tensors, not .item() to avoid sync)
         """
-        input_ids = batch["input_ids"].to(self.device)
+        input_ids = batch["input_ids"]
 
         # Prepare block diffusion batch
         block_batch = self.block_diffusion.prepare_training_batch(
@@ -192,27 +206,29 @@ class Trainer:
             if "mtp_loss" in result:
                 loss = loss + result["mtp_loss"]
 
-        # Compute accuracy on masked positions
+        # Compute accuracy on masked positions - keep as tensor to avoid sync
         with torch.no_grad():
             predictions = logits.argmax(dim=-1)
             correct = (predictions == target_ids) & mask_indicator
-            if mask_indicator.sum() > 0:
-                accuracy = correct.sum().float() / mask_indicator.sum().float()
-            else:
-                accuracy = torch.tensor(0.0)
+            mask_sum = mask_indicator.sum()
+            accuracy = correct.sum().float() / mask_sum.clamp(min=1).float()
 
+        # Return tensors - only call .item() at logging time
         return {
             "loss": loss,
-            "accuracy": accuracy.item(),
-            "masking_ratio": block_batch["masking_ratio"].mean().item(),
-            "masking_ratio_min": block_batch["masking_ratio"].min().item(),
-            "masking_ratio_max": block_batch["masking_ratio"].max().item(),
-            "num_masked": mask_indicator.sum().item(),
-            "mtp_loss": result.get("mtp_loss", torch.tensor(0.0)).item(),
+            "accuracy": accuracy,
+            "masking_ratio": block_batch["masking_ratio"].mean(),
+            "mtp_loss": result.get("mtp_loss", torch.tensor(0.0, device=self.device)),
+        }
+
+    def _prefetch_batch(self, batch: dict) -> dict:
+        """Move batch to GPU asynchronously using non_blocking transfer."""
+        return {
+            "input_ids": batch["input_ids"].to(self.device, non_blocking=True)
         }
 
     def train(self):
-        """Main training loop."""
+        """Main training loop with optimized GPU utilization."""
         self.model.train()
 
         # Create checkpoint directory
@@ -226,25 +242,44 @@ class Trainer:
             initial=self.global_step,
         )
 
-        # Training state
-        accumulated_loss = 0.0
-        accumulated_accuracy = 0.0
+        # Training state - use tensors to avoid CPU sync
+        accumulated_loss = torch.tensor(0.0, device=self.device)
+        accumulated_accuracy = torch.tensor(0.0, device=self.device)
         accumulation_count = 0
+
+        # Metrics averaging since last log interval
+        interval_loss_sum = torch.tensor(0.0, device=self.device)
+        interval_acc_sum = torch.tensor(0.0, device=self.device)
+        interval_step_count = 0
 
         # Tokens per second tracking
         last_log_time = time.time()
         last_log_tokens = self.total_tokens
 
-        self.optimizer.zero_grad()
+        # Track last loss for checkpoint saving
+        last_avg_loss = 0.0
+
+        # Use set_to_none=True for faster zeroing
+        self.optimizer.zero_grad(set_to_none=True)
         data_iter = iter(self.train_loader)
 
+        # Prefetch first batch
+        try:
+            next_batch = self._prefetch_batch(next(data_iter))
+        except StopIteration:
+            data_iter = iter(self.train_loader)
+            next_batch = self._prefetch_batch(next(data_iter))
+
         while self.global_step < self.train_config.max_steps:
-            # Get batch
+            # Use prefetched batch
+            batch = next_batch
+
+            # Start prefetching next batch asynchronously
             try:
-                batch = next(data_iter)
+                next_batch = self._prefetch_batch(next(data_iter))
             except StopIteration:
                 data_iter = iter(self.train_loader)
-                batch = next(data_iter)
+                next_batch = self._prefetch_batch(next(data_iter))
 
             # Forward and backward
             metrics = self.train_step(batch)
@@ -255,8 +290,9 @@ class Trainer:
             else:
                 loss.backward()
 
-            accumulated_loss += metrics["loss"].item()
-            accumulated_accuracy += metrics["accuracy"]
+            # Accumulate on GPU tensors (no sync)
+            accumulated_loss = accumulated_loss + metrics["loss"].detach()
+            accumulated_accuracy = accumulated_accuracy + metrics["accuracy"].detach()
             accumulation_count += 1
 
             self.total_tokens += batch["input_ids"].numel()
@@ -277,16 +313,27 @@ class Trainer:
                     self.optimizer.step()
 
                 self.scheduler.step()
-                self.optimizer.zero_grad()
+                self.optimizer.zero_grad(set_to_none=True)
 
-                avg_loss = accumulated_loss / accumulation_count
-                avg_accuracy = accumulated_accuracy / accumulation_count
+                # Accumulate step metrics for interval averaging
+                avg_loss = (accumulated_loss / accumulation_count).item()
+                avg_accuracy = (accumulated_accuracy / accumulation_count).item()
+                last_avg_loss = avg_loss  # Track for checkpoint saving
+                interval_loss_sum = interval_loss_sum + accumulated_loss / accumulation_count
+                interval_acc_sum = interval_acc_sum + accumulated_accuracy / accumulation_count
+                interval_step_count += 1
 
-                # Logging
+                # Only sync to CPU at logging time
                 if self.global_step % self.train_config.log_every == 0:
+                    # Compute interval averages
+                    avg_loss_interval = (interval_loss_sum / interval_step_count).item()
+                    avg_acc_interval = (interval_acc_sum / interval_step_count).item()
+
+                    masking_ratio = metrics["masking_ratio"].item()
+                    mtp_loss = metrics["mtp_loss"].item()
                     lr = self.scheduler.get_last_lr()[0]
 
-                    # Calculate tokens per second
+                    # Calculate tokens per second for this logging interval
                     current_time = time.time()
                     elapsed_time = current_time - last_log_time
                     tokens_since_last_log = self.total_tokens - last_log_tokens
@@ -294,27 +341,36 @@ class Trainer:
                     last_log_time = current_time
                     last_log_tokens = self.total_tokens
 
+                    # Reset interval accumulators
+                    interval_loss_sum = torch.tensor(0.0, device=self.device)
+                    interval_acc_sum = torch.tensor(0.0, device=self.device)
+                    interval_step_count = 0
+
                     log_metrics = {
                         "train/loss": avg_loss,
+                        "train/loss_avg": avg_loss_interval,
                         "train/accuracy": avg_accuracy,
+                        "train/accuracy_avg": avg_acc_interval,
                         "train/learning_rate": lr,
-                        "train/tokens": self.total_tokens,
+                        "train/total_tokens": self.total_tokens,
                         "train/tokens_per_second": tokens_per_second,
-                        "train/masking_ratio": metrics["masking_ratio"],
-                        "train/masking_ratio_min": metrics.get("masking_ratio_min", 0.0),
-                        "train/masking_ratio_max": metrics.get("masking_ratio_max", 0.0),
-                        "train/mtp_loss": metrics["mtp_loss"],
+                        "train/masking_ratio": masking_ratio,
+                        "train/mtp_loss": mtp_loss,
                     }
                     self._log_metrics(log_metrics, self.global_step)
 
+                    # Format total tokens for display
+                    total_tokens_str = format_number(self.total_tokens)
+
                     pbar.set_postfix(
-                        loss=f"{avg_loss:.4f}",
-                        acc=f"{avg_accuracy:.4f}",
+                        loss=f"{avg_loss_interval:.4f}",
+                        acc=f"{avg_acc_interval:.4f}",
                         tps=f"{tokens_per_second:.0f}",
+                        tokens=total_tokens_str,
                         lr=f"{lr:.2e}",
                     )
 
-                # Save checkpoint
+                # Save checkpoint (use avg_loss from this step)
                 if (
                     self.global_step > 0
                     and self.global_step % self.train_config.save_every == 0
@@ -330,8 +386,8 @@ class Trainer:
                     )
 
                 # Reset accumulators
-                accumulated_loss = 0.0
-                accumulated_accuracy = 0.0
+                accumulated_loss = torch.tensor(0.0, device=self.device)
+                accumulated_accuracy = torch.tensor(0.0, device=self.device)
                 accumulation_count = 0
 
                 self.global_step += 1
@@ -345,7 +401,7 @@ class Trainer:
             self.optimizer,
             self.scheduler,
             self.global_step,
-            avg_loss,
+            last_avg_loss,
             self.config,
             ckpt_dir / "checkpoint_final.pt",
         )

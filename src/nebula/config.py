@@ -15,7 +15,7 @@ from typing import Optional, List
 class ModelConfig:
     """Model architecture configuration."""
 
-    vocab_size: int = 50258  # GPT-2 (50257) + [MASK] token
+    vocab_size: int = 50432  # GPT-2 padded to multiple of 128 for tensor cores
     hidden_dim: int = 128
     num_layers: int = 4
     num_heads: int = 2
@@ -107,6 +107,9 @@ class TrainingConfig:
     mixed_precision: str = "bf16"  # "no", "fp16", "bf16"
     gradient_checkpointing: bool = False
     grad_clip: float = 1.0
+
+    # Optimizer: "muon" (recommended) or "adamw"
+    optimizer: str = "muon"
 
     # torch.compile options (PyTorch 2.0+)
     compile: bool = False  # Enable torch.compile

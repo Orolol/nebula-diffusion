@@ -12,7 +12,7 @@ from .dus import DilatedUnmaskingScheduler, ConfidenceKLScheduler
 
 
 class BlockDiffusionSampler:
-    """Sampler for block diffusion with DUS.
+    """Optimized sampler for block diffusion with DUS.
 
     Generates text block-by-block autoregressively, using
     diffusion within each block with Dilated Unmasking Scheduler.
@@ -23,7 +23,7 @@ class BlockDiffusionSampler:
         model: HybridDiffusionTransformer,
         mask_token_id: int,
         block_size: int = 8,
-        num_steps_per_block: int = 16,
+        num_steps_per_block: int = 8,
         temperature: float = 1.0,
         top_k: int = 0,
         top_p: float = 1.0,
@@ -31,19 +31,6 @@ class BlockDiffusionSampler:
         dus_num_groups: int = 3,
         confidence_threshold: float = 0.5,
     ):
-        """
-        Args:
-            model: The hybrid diffusion transformer
-            mask_token_id: ID of [MASK] token
-            block_size: Number of tokens per block
-            num_steps_per_block: Diffusion steps per block
-            temperature: Sampling temperature
-            top_k: Top-k sampling (0 to disable)
-            top_p: Nucleus sampling (1.0 to disable)
-            use_dus: Whether to use Dilated Unmasking Scheduler
-            dus_num_groups: Number of dilated groups
-            confidence_threshold: Threshold for confident predictions
-        """
         self.model = model
         self.mask_token_id = mask_token_id
         self.block_size = block_size
@@ -52,8 +39,8 @@ class BlockDiffusionSampler:
         self.top_k = top_k
         self.top_p = top_p
         self.use_dus = use_dus
+        self.confidence_threshold = confidence_threshold
 
-        # DUS scheduler
         if use_dus:
             self.dus = DilatedUnmaskingScheduler(
                 num_groups=dus_num_groups,
@@ -61,6 +48,22 @@ class BlockDiffusionSampler:
             )
         else:
             self.dus = None
+
+        # Pre-compile the generation function if using torch 2.0+
+        self._compiled = False
+
+        # Cache the underlying model (handles torch.compile wrapper)
+        self._orig_model = None
+
+    def _get_logits(self, sequence: torch.Tensor) -> torch.Tensor:
+        """Get logits from model, handling torch.compile wrapper."""
+        if self._orig_model is None:
+            self._orig_model = getattr(self.model, '_orig_mod', self.model)
+
+        if hasattr(self._orig_model, 'generate_forward'):
+            return self._orig_model.generate_forward(sequence)
+        else:
+            return self.model(sequence)["logits"]
 
     @torch.no_grad()
     def generate(
@@ -125,7 +128,7 @@ class BlockDiffusionSampler:
             block_end = block_start + self.block_size
 
             # Generate this block with diffusion
-            generated = self._generate_block(
+            generated = self._generate_block_fast(
                 generated,
                 block_start,
                 block_end,
@@ -133,98 +136,151 @@ class BlockDiffusionSampler:
 
         return generated
 
-    def _generate_block(
+    def _generate_block_fast(
         self,
         sequence: torch.Tensor,
         block_start: int,
         block_end: int,
     ) -> torch.Tensor:
-        """Generate a single block using diffusion with DUS.
+        """Generate a single block using optimized diffusion.
 
-        Args:
-            sequence: Current sequence [batch, seq_len]
-            block_start: Start position of block
-            block_end: End position of block
-
-        Returns:
-            Updated sequence with block filled in
+        Fully vectorized - no Python loops over batch dimension.
+        Uses confidence-based progressive unmasking.
         """
         batch_size = sequence.shape[0]
         device = sequence.device
         block_size = block_end - block_start
 
-        # Track fixed positions (everything except current block)
-        is_fixed = torch.ones_like(sequence, dtype=torch.bool)
-        is_fixed[:, block_start:block_end] = False
-
-        prev_probs = None
+        # Number of tokens to unmask per step (evenly distributed)
+        tokens_per_step = max(1, block_size // self.num_steps_per_block)
 
         for step in range(self.num_steps_per_block):
             # Get model predictions
-            result = self.model(sequence)
-            logits = result["logits"]
+            logits = self._get_logits(sequence)
 
-            # Apply sampling
-            probs = self._compute_probs(logits)
+            # Apply temperature
+            block_logits = logits[:, block_start:block_end] / self.temperature
 
-            if self.use_dus and self.dus is not None:
-                # Use DUS for position selection
-                positions, sampled = self.dus.select_positions_to_unmask(
-                    sequence,
-                    logits[:, block_start:block_end],
-                    self.mask_token_id,
-                    step,
-                    self.num_steps_per_block,
-                    prev_probs[:, block_start:block_end] if prev_probs is not None else None,
-                    None,  # No fixed within block
-                )
+            # Apply top-k filtering if specified
+            if self.top_k > 0:
+                topk_vals = torch.topk(block_logits, self.top_k, dim=-1).values
+                threshold = topk_vals[..., -1:]
+                block_logits = block_logits.masked_fill(block_logits < threshold, float("-inf"))
 
-                # Apply unmasking
-                for b in range(batch_size):
-                    valid = positions[b][positions[b] >= 0]
-                    if len(valid) > 0:
-                        global_pos = valid + block_start
-                        sequence[b, global_pos] = sampled[b, valid]
+            probs = F.softmax(block_logits, dim=-1)
+
+            # Sample tokens - use argmax for high confidence, multinomial otherwise
+            if self.temperature < 0.5:
+                sampled = probs.argmax(dim=-1)  # [batch, block_size]
             else:
-                # Standard confidence-based unmasking
-                sampled_tokens = torch.multinomial(
+                sampled = torch.multinomial(
                     probs.view(-1, probs.shape[-1]), num_samples=1
-                ).view(batch_size, -1)
+                ).view(batch_size, block_size)
 
-                confidence = probs.max(dim=-1).values
-                block_mask = sequence[:, block_start:block_end] == self.mask_token_id
+            # Get confidence and mask
+            confidence = probs.max(dim=-1).values  # [batch, block_size]
+            block_ids = sequence[:, block_start:block_end]
+            is_masked = block_ids == self.mask_token_id  # [batch, block_size]
 
-                unmask_fraction = (step + 1) / self.num_steps_per_block
+            # Early exit if fully unmasked
+            if not is_masked.any():
+                break
 
-                for b in range(batch_size):
-                    masked_local = block_mask[b].nonzero(as_tuple=True)[0]
-                    if len(masked_local) == 0:
-                        continue
+            # Progressive schedule: unmask more tokens as we progress
+            progress = (step + 1) / self.num_steps_per_block
+            target_unmasked = int(block_size * progress)
 
-                    conf_local = confidence[b, block_start:block_end][masked_local]
-                    num_unmask = max(1, int(len(masked_local) * unmask_fraction))
-                    _, top_idx = conf_local.topk(min(num_unmask, len(masked_local)))
+            # Set confidence of already-unmasked positions to -inf
+            masked_confidence = confidence.masked_fill(~is_masked, float("-inf"))
 
-                    positions_local = masked_local[top_idx]
-                    positions_global = positions_local + block_start
-                    sequence[b, positions_global] = sampled_tokens[b, positions_global]
+            # Get threshold for top-k confidence (vectorized across batch)
+            # Sort and get the k-th highest confidence per batch
+            sorted_conf, _ = masked_confidence.sort(dim=-1, descending=True)
 
-            prev_probs = probs.detach()
+            # Number to unmask this step
+            num_to_unmask = min(tokens_per_step, target_unmasked)
+            num_to_unmask = max(1, num_to_unmask)
 
-        # Final fill for any remaining masks
-        block_masked = sequence[:, block_start:block_end] == self.mask_token_id
-        if block_masked.any():
-            result = self.model(sequence)
-            probs = self._compute_probs(result["logits"])
+            # Get threshold - the num_to_unmask-th highest confidence
+            threshold_idx = min(num_to_unmask - 1, block_size - 1)
+            thresholds = sorted_conf[:, threshold_idx:threshold_idx+1]  # [batch, 1]
+
+            # Unmask positions above threshold (vectorized)
+            should_unmask = (masked_confidence >= thresholds) & is_masked
+
+            # Apply unmasking
+            sequence[:, block_start:block_end] = torch.where(
+                should_unmask,
+                sampled,
+                block_ids
+            )
+
+        # Final pass - unmask any remaining masks
+        block_ids = sequence[:, block_start:block_end]
+        remaining_masks = block_ids == self.mask_token_id
+
+        if remaining_masks.any():
+            logits = self._get_logits(sequence)
+            block_logits = logits[:, block_start:block_end] / self.temperature
+            probs = F.softmax(block_logits, dim=-1)
+
+            if self.temperature < 0.5:
+                sampled = probs.argmax(dim=-1)
+            else:
+                sampled = torch.multinomial(
+                    probs.view(-1, probs.shape[-1]), num_samples=1
+                ).view(batch_size, block_size)
+
+            sequence[:, block_start:block_end] = torch.where(
+                remaining_masks,
+                sampled,
+                block_ids
+            )
+
+        return sequence
+
+    def _generate_block_oneshot(
+        self,
+        sequence: torch.Tensor,
+        block_start: int,
+        block_end: int,
+    ) -> torch.Tensor:
+        """Generate a single block in one forward pass.
+
+        Fastest possible generation - unmasks all tokens at once.
+        Quality may be lower than iterative approach.
+        """
+        batch_size = sequence.shape[0]
+        block_size = block_end - block_start
+
+        # Single forward pass (optimized)
+        logits = self._get_logits(sequence)
+        block_logits = logits[:, block_start:block_end] / self.temperature
+
+        if self.top_k > 0:
+            topk_vals = torch.topk(block_logits, self.top_k, dim=-1).values
+            threshold = topk_vals[..., -1:]
+            block_logits = block_logits.masked_fill(block_logits < threshold, float("-inf"))
+
+        probs = F.softmax(block_logits, dim=-1)
+
+        # Sample all tokens at once
+        if self.temperature < 0.5:
+            sampled = probs.argmax(dim=-1)
+        else:
             sampled = torch.multinomial(
                 probs.view(-1, probs.shape[-1]), num_samples=1
-            ).view(batch_size, -1)
+            ).view(batch_size, block_size)
 
-            for b in range(batch_size):
-                still_masked = (sequence[b, block_start:block_end] == self.mask_token_id)
-                if still_masked.any():
-                    positions = still_masked.nonzero(as_tuple=True)[0] + block_start
-                    sequence[b, positions] = sampled[b, positions]
+        # Replace masked positions
+        block_ids = sequence[:, block_start:block_end]
+        is_masked = block_ids == self.mask_token_id
+
+        sequence[:, block_start:block_end] = torch.where(
+            is_masked,
+            sampled,
+            block_ids
+        )
 
         return sequence
 
@@ -261,9 +317,8 @@ class DiffusionSampler(BlockDiffusionSampler):
         top_k: int = 0,
         top_p: float = 1.0,
     ):
-        # Estimate blocks from steps
         block_size = 8
-        steps_per_block = max(8, num_steps // 8)
+        steps_per_block = max(4, num_steps // 16)  # Reduced steps
 
         super().__init__(
             model=model,

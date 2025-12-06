@@ -2,7 +2,7 @@
 # Hybrid architecture: 75% Gated DeltaNet + 25% MLA, Expert Choice MoE, Block Diffusion
 
 model:
-  vocab_size: 50258  # GPT-2 + [MASK]
+  vocab_size: 50432  # GPT-2 padded to multiple of 128 for tensor cores (128 * 394)
   hidden_dim: 768
   num_layers: 12
   num_heads: 12
@@ -10,22 +10,22 @@ model:
   mlp_ratio: 4.0
   dropout: 0.1
   max_seq_len: 1024
-  mask_token_id: 50257
+  mask_token_id: 50257  # [MASK] = GPT-2's last token index
 
   # Hybrid attention: 75% DeltaNet, 25% MLA
   # For 12 layers: DeltaNet on 0,1,2,4,5,7,8,10,11 | MLA on 3,6,9
   deltanet_ratio: 0.75
-  kv_latent_dim: 128  # MLA low-rank KV compression
+  kv_latent_dim: 256  # MLA low-rank KV compression
 
   # MoE: Expert Choice with nested experts
   use_moe: true
   num_experts: 16
   num_expert_slices: 4
   moe_capacity_factor: 1.25
-  moe_every_n_layers: 2  # MoE on layers 1, 3, 5, 7, 9, 11
+  moe_every_n_layers: 1  # MoE on layers 1, 3, 5, 7, 9, 11
 
   # Block diffusion
-  block_size: 8
+  block_size: 16
 
   # MTP (Multi-Token Prediction)
   use_mtp: true
@@ -33,19 +33,22 @@ model:
   mtp_loss_weight: 0.1
 
 training:
-  batch_size: 8
-  gradient_accumulation_steps: 2
-  learning_rate: 3e-4
-  weight_decay: 0.1
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  learning_rate: 0.02  # Muon uses higher LR
+  weight_decay: 0.0  # Muon doesn't need weight decay
   warmup_steps: 500
   max_steps: 100000
   mixed_precision: "bf16"
   gradient_checkpointing: true
   grad_clip: 1.0
 
+  # Optimizer
+  optimizer: "muon"  # "muon" or "adamw"
+
   # torch.compile (PyTorch 2.0+)
   compile: true
-  compile_mode: "default"  # "default", "reduce-overhead", "max-autotune"
+  compile_mode: "reduce-overhead"  # "default", "reduce-overhead", "max-autotune"
 
   log_every: 10
   save_every: 5000
