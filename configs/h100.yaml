@@ -35,7 +35,7 @@ model:
 training:
   # Larger batch for better GPU utilization on 5090 (32GB)
   # Effective batch = 16 * 4 = 64 samples
-  batch_size: 16  
+  batch_size: 8  
   gradient_accumulation_steps: 4
   learning_rate: 0.02  # Muon uses higher LR
   weight_decay: 0.0  # Muon doesn't need weight decay
